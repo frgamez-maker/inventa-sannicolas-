@@ -1428,6 +1428,8 @@ async function refreshAll() {
     try { renderSalesScreen(); } catch(e) { console.warn('renderSalesScreen:', e); }
     try { renderReportChart(); } catch(e) { console.warn('renderReportChart:', e); }
     try { renderCatChips(); } catch(e) { console.warn('renderCatChips:', e); }
+    // Sincronizar precios de carnes desde Supabase a carnState local
+    try { carnSyncPreciosDesdeSupabase(); } catch(e) { console.warn('carnSync:', e); }
 
     const catSub = document.getElementById('cat-count-sub');
     if (catSub) catSub.textContent = S.categories.length + ' categorías';
@@ -2369,15 +2371,60 @@ const CORTES_CATALOGO = {
 
 // ── ESTADO ────────────────────────────────────────────────────────
 let carnState = {
-  compras:  JSON.parse(localStorage.getItem('carn_compras') || '[]'),
-  canales:  JSON.parse(localStorage.getItem('carn_canales') || '[]'),  // canales procesadas
-  stockCortes: JSON.parse(localStorage.getItem('carn_stock') || '[]'), // stock de cada corte
+  compras:     JSON.parse(localStorage.getItem('carn_compras')  || '[]'),
+  canales:     JSON.parse(localStorage.getItem('carn_canales')  || '[]'),
+  stockCortes: JSON.parse(localStorage.getItem('carn_stock')    || '[]'),
 };
 
 function carnSave() {
   localStorage.setItem('carn_compras',  JSON.stringify(carnState.compras));
   localStorage.setItem('carn_canales',  JSON.stringify(carnState.canales));
   localStorage.setItem('carn_stock',    JSON.stringify(carnState.stockCortes));
+}
+
+// ── SINCRONIZAR PRECIOS DESDE SUPABASE ────────────────────────────
+// Los precios viven en S.products (Supabase). Al cargar, los copiamos
+// a carnState.stockCortes para que el módulo de carnicería los vea.
+function carnSyncPreciosDesdeSupabase() {
+  carnState.stockCortes.forEach(s => {
+    const skuEsperado = (s.especie.substring(0,3) + '-' + s.corteId).toUpperCase().replace(/_/g,'-');
+    const prod = S.products.find(p =>
+      p.sku === skuEsperado ||
+      p.sku.includes(s.corteId.replace(/_/g,'-').toUpperCase())
+    );
+    if (prod && prod.price > 0) {
+      s.precioVenta = prod.price; // sincronizar precio desde Supabase
+    }
+    // También sincronizar stock disponible
+    if (prod) {
+      s.kgDisponible = prod.stock;
+    }
+  });
+  // Si hay productos de carnes en S.products que no están en carnState, agregarlos
+  S.products.filter(p => p.cat === 'carnes').forEach(p => {
+    const yaExiste = carnState.stockCortes.find(s => {
+      const skuEsperado = (s.especie.substring(0,3) + '-' + s.corteId).toUpperCase().replace(/_/g,'-');
+      return p.sku === skuEsperado || p.sku.includes(s.corteId.replace(/_/g,'-').toUpperCase());
+    });
+    if (!yaExiste && p.price >= 0) {
+      // Inferir especie y corteId desde el SKU
+      const partes = p.sku.toLowerCase().split('-');
+      const espMap  = { res:'res', cer:'cerdo', pol:'pollo' };
+      const especie = espMap[partes[0]] || 'res';
+      carnState.stockCortes.push({
+        corteId:      partes.slice(1).join('_'),
+        especie,
+        name:         p.name,
+        emoji:        p.emoji || '🥩',
+        kgDisponible: p.stock,
+        kgTotal:      p.stock,
+        kgVendido:    0,
+        precioVenta:  p.price,
+        costoKg:      0,
+      });
+    }
+  });
+  carnSave();
 }
 
 // ── TABS ──────────────────────────────────────────────────────────
@@ -2858,7 +2905,7 @@ function carnEditarPrecio(corteId) {
     <div style="font-size:11px;color:var(--tx2);font-family:var(--fm);margin-bottom:14px" id="precio-margen">
       ${s.precioVenta && s.costoKg ? 'Margen: $'+fmtDec(s.precioVenta-s.costoKg)+'/kg ('+Math.round((s.precioVenta-s.costoKg)/s.precioVenta*100)+'%)' : 'Ingresa el precio para ver el margen'}
     </div>
-    <button class="btn btn-p btn-w" onclick="carnGuardarPrecio('${corteId}')">💾 Guardar precio</button>
+    <button class="btn btn-p btn-w" id="btn-guardar-precio" onclick="carnGuardarPrecio('${corteId}')">💾 Guardar precio</button>
   `);
   setTimeout(() => {
     document.getElementById('precio-venta-inp')?.addEventListener('input', function() {
@@ -2877,11 +2924,12 @@ async function carnGuardarPrecio(corteId) {
   const pv = parseFloat(document.getElementById('precio-venta-inp')?.value) || 0;
   if (!s || !pv) { showToast('Ingresa el precio','error'); return; }
 
+  const btn = document.getElementById('btn-guardar-precio');
+  if (btn) { btn.innerHTML = '<span class="spinner"></span>'; btn.disabled = true; }
+
   s.precioVenta = pv;
   carnSave();
 
-  // Buscar el producto en S.products por SKU — el SKU se forma como
-  // primeras 3 letras especie + '-' + corteId en mayúsculas con guiones
   const skuBuscado = (s.especie.substring(0,3) + '-' + corteId).toUpperCase().replace(/_/g,'-');
   const prod = S.products.find(p =>
     p.sku === skuBuscado ||
@@ -2890,30 +2938,37 @@ async function carnGuardarPrecio(corteId) {
 
   if (prod) {
     prod.price = pv;
-    // Actualizar precio en Supabase via un movimiento de ajuste de precio
-    // (no hay endpoint de update directo, se actualiza en la BD)
     try {
-      // En modo Supabase actualizamos directamente
       if (APP_CONFIG.backendType === 'supabase' && SupabaseAdapter._client) {
-        await SupabaseAdapter._client
+        // Guardar en Supabase — así todos los dispositivos ven el precio actualizado
+        const { error } = await SupabaseAdapter._client
           .from('products')
-          .update({ price: pv })
+          .update({ price: pv, updated_at: new Date().toISOString() })
           .eq('id', prod.id);
+        if (error) throw error;
+        showToast('✅ Precio guardado en servidor — visible en todos los dispositivos', 'success');
+      } else {
+        // Modo demo: actualizar localStorage
+        const stored = JSON.parse(localStorage.getItem('inv3_products') || '[]');
+        const si = stored.findIndex(p => p.id === prod.id);
+        if (si >= 0) { stored[si].price = pv; localStorage.setItem('inv3_products', JSON.stringify(stored)); }
+        showToast('Precio guardado ✓', 'success');
       }
-    } catch(e) { console.warn('Update precio Supabase:', e); }
+    } catch(e) {
+      console.error('Error guardando precio:', e);
+      showToast('⚠️ Guardado localmente — verifica conexión a internet', 'warning');
+    }
+  } else {
+    showToast('⚠️ Producto no encontrado — procesa el canal primero', 'warning');
   }
 
-  // También actualizar todos los items del carrito que tengan este producto
-  posCart.forEach(item => {
-    if (item.pid === prod?.id) item.price = pv;
-  });
+  posCart.forEach(item => { if (item.pid === prod?.id) item.price = pv; });
 
+  if (btn) { btn.innerHTML = '💾 Guardar precio'; btn.disabled = false; }
   closeOv();
   carnRenderStock();
-  // Refrescar POS para que muestre el precio actualizado
   renderPOSGrid();
   renderPOSCart();
-  showToast('Precio actualizado ✓ — ya visible en Caja', 'success');
 }
 
 // ── REPORTE DE RENDIMIENTO ────────────────────────────────────────
