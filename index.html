@@ -1422,26 +1422,30 @@ async function refreshAll() {
     S.sales      = sales;
     S.counts     = counts;
 
-    // ── SINCRONIZAR precios de carnState desde S.products ──────────
-    // Esto asegura que cuando cargue otro dispositivo, los precios
-    // guardados en Supabase se reflejen también en carnState local.
-    if (carnState.stockCortes.length > 0) {
-      carnState.stockCortes.forEach(s => {
-        const skuBuscado = (s.especie.substring(0,3) + '-' + s.corteId).toUpperCase().replace(/_/g,'-');
-        const prod = S.products.find(p =>
-          p.sku === skuBuscado ||
-          p.sku.includes(s.corteId.replace(/_/g,'-').toUpperCase())
-        );
-        if (prod && prod.price > 0 && prod.price !== s.precioVenta) {
-          s.precioVenta = prod.price; // tomar precio de Supabase (fuente de verdad)
-        }
-        // También sincronizar kg disponibles con stock real de Supabase
-        if (prod && prod.stock !== s.kgDisponible) {
-          s.kgDisponible = prod.stock;
-        }
+    // ── SINCRONIZAR carnState SIEMPRE desde S.products (Supabase es la fuente de verdad) ──
+    // Funciona aunque carnState esté vacío (celular sin datos de carnicería):
+    // reconstruye el stockCortes a partir de los productos con categoría 'carnes'.
+    const carneProds = S.products.filter(p =>
+      (p.cat || '').toLowerCase() === 'carnes' ||
+      (p.category || '').toLowerCase() === 'carnes'
+    );
+    carneProds.forEach(prod => {
+      if (!prod.price || prod.price <= 0) return; // sin precio, nada que sincronizar
+      // Buscar si ya existe en carnState por SKU
+      const existe = carnState.stockCortes.find(s => {
+        const skuEsperado = (s.especie.substring(0,3) + '-' + s.corteId).toUpperCase().replace(/_/g,'-');
+        return prod.sku === skuEsperado ||
+               prod.sku.includes(s.corteId.replace(/_/g,'-').toUpperCase());
       });
-      carnSave(); // guardar estado sincronizado
-    }
+      if (existe) {
+        // Actualizar precio y stock desde Supabase
+        if (prod.price > 0) existe.precioVenta = prod.price;
+        existe.kgDisponible = prod.stock;
+      }
+      // Si NO existe en carnState pero sí en Supabase, crearlo (caso: operador sin historial local)
+      // No crear entrada nueva automáticamente porque faltan datos de compra; solo actualizar precios.
+    });
+    if (carneProds.length > 0) carnSave();
 
     // Renderizar cada sección de forma independiente para que un error no bloquee las demás
     try { renderDash(); } catch(e) { console.warn('renderDash:', e); }
@@ -1449,6 +1453,8 @@ async function refreshAll() {
     try { renderSalesScreen(); } catch(e) { console.warn('renderSalesScreen:', e); }
     try { renderReportChart(); } catch(e) { console.warn('renderReportChart:', e); }
     try { renderCatChips(); } catch(e) { console.warn('renderCatChips:', e); }
+    try { renderPOSGrid(); } catch(e) { console.warn('renderPOSGrid:', e); }
+    try { renderPOSCart(); } catch(e) { console.warn('renderPOSCart:', e); }
 
     const catSub = document.getElementById('cat-count-sub');
     if (catSub) catSub.textContent = S.categories.length + ' categorías';
@@ -1468,12 +1474,21 @@ function handleRealtimeEvent(event) {
     // Eventos de Supabase Realtime vienen con estructura diferente
     // { type: 'STOCK_UPDATED', payload: { new: {...}, old: {...} } }
     if (event.payload) {
-      // Es un evento de Supabase Realtime — siempre refrescar
-      await refreshAll();
+      // Es un evento de Supabase Realtime — siempre refrescar todos los datos
+      await refreshAll(); // refreshAll ya llama renderPOSGrid internamente
       // Solo mostrar banner si NO fue este mismo usuario
       const updatedBy = event.payload.new?.updated_by;
+      const changedPrice = event.payload.new?.price;
+      const productName  = event.payload.new?.name;
       if (updatedBy && updatedBy !== S.session?.id) {
-        showConflictBanner('Otro usuario actualizó el inventario', 'Datos recargados automáticamente');
+        if (changedPrice > 0 && productName) {
+          showConflictBanner(
+            `Precio actualizado: ${productName}`,
+            `Nuevo precio: $${Number(changedPrice).toFixed(2)} — datos recargados`
+          );
+        } else {
+          showConflictBanner('Inventario actualizado por otro usuario', 'Datos recargados automáticamente');
+        }
       }
       return;
     }
@@ -2819,8 +2834,33 @@ async function carnGuardarCorte(compraId) {
 function carnRenderStock() {
   const el = document.getElementById('carn-stock-list');
   if (!el) return;
+
+  // Si no hay carnState local, reconstruir desde S.products (caso: celular/operador)
   if (!carnState.stockCortes.length) {
-    el.innerHTML = '<div style="text-align:center;padding:24px;color:var(--tx3);font-size:12px;font-family:var(--fm)">Sin stock — procesa una canal primero</div>';
+    const carneProds = S.products.filter(p =>
+      (p.cat || '').toLowerCase() === 'carnes' ||
+      (p.category || '').toLowerCase() === 'carnes'
+    );
+    if (!carneProds.length) {
+      el.innerHTML = '<div style="text-align:center;padding:24px;color:var(--tx3);font-size:12px;font-family:var(--fm)">Sin stock — procesa una canal primero</div>';
+      return;
+    }
+    // Mostrar productos de carne desde Supabase aunque no haya carnState local
+    el.innerHTML = '<div style="font-size:11px;font-weight:700;color:var(--tx3);font-family:var(--fm);letter-spacing:.1em;margin:14px 0 8px">🥩 CORTES DISPONIBLES</div>' +
+      '<div class="card" style="padding:12px 14px">' +
+      carneProds.map(p => `
+        <div class="corte-row">
+          <div class="corte-emoji">${p.emoji || '🥩'}</div>
+          <div class="corte-info">
+            <div class="corte-name">${p.name}</div>
+            <div class="corte-sub">Precio venta: ${p.price > 0 ? '$' + fmtDec(p.price) + '/kg' : 'Sin definir'}</div>
+          </div>
+          <div style="text-align:right;min-width:60px">
+            <div style="font-size:16px;font-weight:900;color:var(--gr)">${fmtDec(p.stock)}</div>
+            <div style="font-size:10px;color:var(--tx3)">kg</div>
+          </div>
+        </div>`).join('') +
+      '</div>';
     return;
   }
   const emojisEsp = { res:'🐄', cerdo:'🐷', pollo:'🐔' };
@@ -2911,7 +2951,11 @@ async function carnGuardarPrecio(corteId) {
       if (APP_CONFIG.backendType === 'supabase' && SupabaseAdapter._client) {
         const { error } = await SupabaseAdapter._client
           .from('products')
-          .update({ price: pv, updated_at: new Date().toISOString() })
+          .update({
+            price:      pv,
+            updated_at: new Date().toISOString(),
+            updated_by: S.session?.id || null,   // <-- necesario para que el otro dispositivo sepa quién cambió
+          })
           .eq('id', prod.id);
         if (error) {
           console.warn('Error actualizando precio en Supabase:', error);
