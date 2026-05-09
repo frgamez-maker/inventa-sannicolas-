@@ -1371,6 +1371,7 @@ async function doLogin() {
 
 async function doLogout() {
   try { DeviceLock.releaseAll(); } catch(e) {}
+  stopPolling();
   S.unsubscribe?.();
   S.stopPresence?.();
   await Backend.logout();
@@ -1395,6 +1396,9 @@ async function initApp() {
 
   // Iniciar presencia
   S.stopPresence = Backend.startPresence(S.session.id, S.session.name);
+
+  // Polling de respaldo (por si Supabase Realtime no tiene replication habilitada)
+  startPolling();
 
   // Polling de presencia (para mostrar usuarios online)
   setInterval(updateOnlineUsers, 15000);
@@ -1432,11 +1436,13 @@ async function refreshAll() {
     );
     carneProds.forEach(prod => {
       if (!prod.price || prod.price <= 0) return; // sin precio, nada que sincronizar
-      // Buscar si ya existe en carnState por SKU
+      // Buscar si ya existe en carnState por SKU (múltiples variantes posibles)
       const existe = carnState.stockCortes.find(s => {
-        const skuEsperado = (s.especie.substring(0,3) + '-' + s.corteId).toUpperCase().replace(/_/g,'-');
-        return prod.sku === skuEsperado ||
-               prod.sku.includes(s.corteId.replace(/_/g,'-').toUpperCase());
+        const sku1 = (s.especie.substring(0,3) + '-' + s.corteId).toUpperCase().replace(/_/g,'-');
+        const sku2 = s.corteId.toUpperCase().replace(/_/g,'-');
+        const sku3 = (s.especie.substring(0,3) + '-' + s.corteId.replace(/^[a-z]+_/,'')).toUpperCase().replace(/_/g,'-');
+        return prod.sku === sku1 || prod.sku === sku2 || prod.sku === sku3 ||
+               prod.sku.includes(s.corteId.replace(/^[a-z]+_/,'').replace(/_/g,'-').toUpperCase());
       });
       if (existe) {
         // Actualizar precio y stock desde Supabase
@@ -2936,11 +2942,19 @@ async function carnGuardarPrecio(corteId) {
   s.precioVenta = pv;
   carnSave();
 
-  // Buscar el producto en S.products por SKU
-  const skuBuscado = (s.especie.substring(0,3) + '-' + corteId).toUpperCase().replace(/_/g,'-');
+  // Buscar el producto en S.products — intentar múltiples variantes de SKU
+  // corteId puede ser "res_pierna", "cer_lomo", "pol_pechuga", etc.
+  // El SKU en Supabase se creó como: especie[0:3] + '-' + corteId → toUpperCase → reemplazar _ con -
+  // Ej: especie="res", corteId="res_pierna" → "RES-RES-PIERNA" (bug histórico)
+  //     o bien el SKU se creó como solo corteId.toUpperCase → "RES-PIERNA" (correcto)
+  // Por eso buscamos por nombre también como fallback.
+  const skuV1 = (s.especie.substring(0,3) + '-' + corteId).toUpperCase().replace(/_/g,'-'); // "RES-RES-PIERNA"
+  const skuV2 = corteId.toUpperCase().replace(/_/g,'-');                                      // "RES-PIERNA"
+  const skuV3 = (s.especie.substring(0,3) + '-' + corteId.replace(/^[a-z]+_/,'')).toUpperCase().replace(/_/g,'-'); // "RES-PIERNA" (sin prefijo de especie en corteId)
   const prod = S.products.find(p =>
-    p.sku === skuBuscado ||
-    p.sku.includes(corteId.replace(/_/g,'-').toUpperCase())
+    p.sku === skuV1 || p.sku === skuV2 || p.sku === skuV3 ||
+    p.sku.includes(corteId.replace(/^[a-z]+_/,'').replace(/_/g,'-').toUpperCase()) ||
+    p.name.toLowerCase().includes(s.name?.toLowerCase() || corteId.replace(/_/g,' '))
   );
 
   if (prod) {
@@ -2950,17 +2964,23 @@ async function carnGuardarPrecio(corteId) {
     // 2. Actualizar en Supabase (fuente de verdad compartida)
     try {
       if (APP_CONFIG.backendType === 'supabase' && SupabaseAdapter._client) {
-        const { error } = await SupabaseAdapter._client
+        // Intentar UPDATE con updated_by (si la columna existe)
+        let { error } = await SupabaseAdapter._client
           .from('products')
-          .update({
-            price:      pv,
-            updated_at: new Date().toISOString(),
-            updated_by: S.session?.id || null,   // <-- necesario para que el otro dispositivo sepa quién cambió
-          })
+          .update({ price: pv, updated_at: new Date().toISOString(), updated_by: S.session?.id || null })
           .eq('id', prod.id);
+
+        // Si falla (ej: columna updated_by no existe), reintentar solo con price
         if (error) {
-          console.warn('Error actualizando precio en Supabase:', error);
-          showToast('Precio guardado localmente (error de red)', 'warning');
+          console.warn('Reintentando UPDATE sin updated_by:', error.message);
+          const retry = await SupabaseAdapter._client
+            .from('products')
+            .update({ price: pv })
+            .eq('id', prod.id);
+          if (retry.error) {
+            console.error('Error actualizando precio en Supabase:', retry.error);
+            showToast('⚠️ Error al guardar en Supabase: ' + retry.error.message, 'error');
+          }
         }
       } else if (APP_CONFIG.backendType === 'demo') {
         // En modo demo, actualizar en localStorage también
@@ -3726,8 +3746,58 @@ function updateSyncUI(ok = true) {
   }
 }
 
-function forceRefresh() {
-  refreshAll().then(() => showToast('Datos actualizados ✓','success'));
+async function forceRefresh() {
+  showToast('Recargando datos...', 'info');
+  await refreshAll();
+  showToast('Datos actualizados ✓', 'success');
+}
+
+// ── POLLING DE RESPALDO ───────────────────────────────────────────
+// Si Supabase Realtime no entrega eventos (tabla sin replication habilitada),
+// este polling garantiza que los precios se sincronicen cada 30 segundos.
+let _pollInterval = null;
+function startPolling() {
+  if (_pollInterval) return; // ya activo
+  _pollInterval = setInterval(async () => {
+    if (!S.session || APP_CONFIG.backendType !== 'supabase') return;
+    try {
+      const fresh = await Backend.getProducts();
+      let changed = false;
+      fresh.forEach(fp => {
+        const idx = S.products.findIndex(p => p.id === fp.id);
+        if (idx >= 0 && (S.products[idx].price !== fp.price || S.products[idx].stock !== fp.stock)) {
+          S.products[idx] = { ...S.products[idx], ...fp };
+          changed = true;
+        }
+      });
+      if (changed) {
+        // Sincronizar carnState con nuevos precios
+        const carneProds = S.products.filter(p =>
+          (p.cat || '').toLowerCase() === 'carnes' ||
+          (p.category || '').toLowerCase() === 'carnes'
+        );
+        carneProds.forEach(prod => {
+          const existe = carnState.stockCortes.find(s => {
+            const sku1 = (s.especie.substring(0,3) + '-' + s.corteId).toUpperCase().replace(/_/g,'-');
+            const sku2 = s.corteId.toUpperCase().replace(/_/g,'-');
+            const sku3 = (s.especie.substring(0,3) + '-' + s.corteId.replace(/^[a-z]+_/,'')).toUpperCase().replace(/_/g,'-');
+            return prod.sku === sku1 || prod.sku === sku2 || prod.sku === sku3;
+          });
+          if (existe && prod.price > 0) existe.precioVenta = prod.price;
+        });
+        if (carneProds.length) carnSave();
+        try { renderPOSGrid(); } catch(e) {}
+        try { renderPOSCart(); } catch(e) {}
+        try { renderDash(); } catch(e) {}
+        try { carnRenderStock(); } catch(e) {}
+        updateSyncUI(true);
+      }
+    } catch(e) { /* silencioso */ }
+  }, 30000); // cada 30 segundos
+}
+
+function stopPolling() {
+  if (_pollInterval) { clearInterval(_pollInterval); _pollInterval = null; }
 }
 
 function togSet(k) {
