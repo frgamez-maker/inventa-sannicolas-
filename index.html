@@ -1370,6 +1370,7 @@ async function doLogin() {
 }
 
 async function doLogout() {
+  try { DeviceLock.releaseAll(); } catch(e) {}
   S.unsubscribe?.();
   S.stopPresence?.();
   await Backend.logout();
@@ -3115,12 +3116,11 @@ const DeviceLock = {
   },
 };
 
-// Liberar bloqueos al cerrar sesión
-const _origDoLogout = doLogout;
-async function doLogout() {
-  DeviceLock.releaseAll();
-  await _origDoLogout();
-}
+// DeviceLock.releaseAll() se llama desde el doLogout original (ver arriba)
+
+/* ═══════════════════════════════════════════════════════════════════
+   ╔═══════════════════════════════════════════════════════════╗
+   ║  SECCIÓN 12: CONTEO FÍSICO                                ║
    ╚═══════════════════════════════════════════════════════════╝
 ═══════════════════════════════════════════════════════════════════ */
 function startCount() {
