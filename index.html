@@ -1209,6 +1209,35 @@ const SupabaseAdapter = {
     return data;
   },
 
+  async updateProductPrice(productId, price, userId) {
+    // Intentar primero con RPC (si existe) — salta RLS
+    try {
+      const { data, error } = await this._client.rpc('update_product_price', {
+        p_product_id: productId,
+        p_price:      price,
+        p_user_id:    userId || null,
+      });
+      if (!error) return { ok: true, via: 'rpc' };
+      // RPC no existe todavía — caer al UPDATE directo
+      console.warn('RPC update_product_price no disponible, usando UPDATE directo:', error.message);
+    } catch(e) {}
+
+    // UPDATE directo (funciona si RLS lo permite o si eres admin)
+    const { error: err2 } = await this._client
+      .from('products')
+      .update({ price, updated_at: new Date().toISOString(), updated_by: userId || null })
+      .eq('id', productId);
+    if (err2) {
+      // Último intento: solo price sin columnas extras
+      const { error: err3 } = await this._client
+        .from('products')
+        .update({ price })
+        .eq('id', productId);
+      if (err3) throw new Error('No se pudo actualizar precio: ' + err3.message);
+    }
+    return { ok: true, via: 'direct' };
+  },
+
   subscribe(callback) {
     this._sub = this._client
       .channel('inventa_changes')
@@ -1421,22 +1450,35 @@ async function refreshAll() {
       Backend.getSales(50).catch(() => S.sales.length ? S.sales : []),
       Backend.getCounts().catch(() => S.counts.length ? S.counts : []),
     ]);
-    // ── MERGE inteligente de precios ─────────────────────────────────────────
-    // Prioridad: 1) Supabase (si precio > 0)  2) memoria local  3) backup localStorage
-    // Esto evita que un refreshAll borre precios actualizados.
-    products.forEach(fp => {
-      // Buscar respaldo en localStorage por id
-      const backup = parseFloat(localStorage.getItem('inv3_price_' + fp.id) || '0');
-      // Buscar precio actual en memoria
-      const inMem = S.products.find(p => p.id === fp.id);
-      const memPrice = inMem ? inMem.price : 0;
+    // ── Asociar productId a carnState entries que no lo tengan ──────────────
+    // Esto resuelve el caso del celular que nunca procesó canales
+    carnState.stockCortes.forEach(s => {
+      if (s.productId) return; // ya tiene id directo
+      const skuV1 = (s.especie.substring(0,3) + '-' + s.corteId).toUpperCase().replace(/_/g,'-');
+      const skuV2 = s.corteId.toUpperCase().replace(/_/g,'-');
+      const skuV3 = (s.especie.substring(0,3) + '-' + s.corteId.replace(/^[a-z]+_/,'')).toUpperCase().replace(/_/g,'-');
+      const nombreBuscar = (s.name || s.corteId.replace(/_/g,' ')).toLowerCase();
+      const match = products.find(p =>
+        p.sku === skuV1 || p.sku === skuV2 || p.sku === skuV3 ||
+        p.sku.includes(s.corteId.replace(/^[a-z]+_/,'').replace(/_/g,'-').toUpperCase()) ||
+        p.name.toLowerCase().includes(nombreBuscar)
+      );
+      if (match) { s.productId = match.id; }
+    });
 
-      if (!fp.price || fp.price === 0) {
-        // Supabase no tiene precio — usar el mejor disponible
-        fp.price = backup > 0 ? backup : (memPrice > 0 ? memPrice : 0);
-      } else {
-        // Supabase tiene precio — es la fuente de verdad, pero guardar backup
+    // ── Supabase es la única fuente de verdad para precios ──────────────────
+    // Si Supabase trae precio > 0: usarlo y actualizar backup local.
+    // Si Supabase trae precio = 0: usar backup local SOLO de ESTE dispositivo
+    //   (el backup lo escribió este mismo dispositivo al guardar un precio).
+    // NUNCA mezclar backups entre dispositivos — cada quien tiene su propio localStorage.
+    products.forEach(fp => {
+      if (fp.price > 0) {
+        // Supabase tiene precio válido — actualizar backup local
         try { localStorage.setItem('inv3_price_' + fp.id, String(fp.price)); } catch(e) {}
+      } else {
+        // Supabase dice 0 — usar backup local si existe (lo puso este mismo dispositivo)
+        const backup = parseFloat(localStorage.getItem('inv3_price_' + fp.id) || '0');
+        if (backup > 0) fp.price = backup;
       }
     });
     S.products   = products;
@@ -2791,6 +2833,10 @@ async function carnGuardarCorte(compraId) {
           S.products[idx].stock   = result.product.stock;
           S.products[idx].version = result.product.version;
         }
+        // Guardar productId en carnState
+        const scIdx2 = carnState.stockCortes.findIndex(s => s.corteId === ct.id);
+        if (scIdx2 >= 0) carnState.stockCortes[scIdx2].productId = existe.id;
+        carnSave();
       } catch(e) {
         // Fallback: actualizar solo en memoria
         const idx = S.products.findIndex(p => p.id === existe.id);
@@ -2820,6 +2866,10 @@ async function carnGuardarCorte(compraId) {
           version:  1,
         }, S.session.id, S.session.name);
         S.products.unshift(np);
+        // Guardar productId en carnState para encontrarlo sin SKU matching
+        const scIdx = carnState.stockCortes.findIndex(s => s.corteId === ct.id);
+        if (scIdx >= 0) carnState.stockCortes[scIdx].productId = np.id;
+        carnSave();
       } catch(e) {
         // Fallback: agregar solo en memoria si Supabase falla
         const fallbackProd = {
@@ -2960,20 +3010,22 @@ async function carnGuardarPrecio(corteId) {
   s.precioVenta = pv;
   carnSave();
 
-  // Buscar el producto en S.products — intentar múltiples variantes de SKU
-  // corteId puede ser "res_pierna", "cer_lomo", "pol_pechuga", etc.
-  // El SKU en Supabase se creó como: especie[0:3] + '-' + corteId → toUpperCase → reemplazar _ con -
-  // Ej: especie="res", corteId="res_pierna" → "RES-RES-PIERNA" (bug histórico)
-  //     o bien el SKU se creó como solo corteId.toUpperCase → "RES-PIERNA" (correcto)
-  // Por eso buscamos por nombre también como fallback.
-  const skuV1 = (s.especie.substring(0,3) + '-' + corteId).toUpperCase().replace(/_/g,'-'); // "RES-RES-PIERNA"
-  const skuV2 = corteId.toUpperCase().replace(/_/g,'-');                                      // "RES-PIERNA"
-  const skuV3 = (s.especie.substring(0,3) + '-' + corteId.replace(/^[a-z]+_/,'')).toUpperCase().replace(/_/g,'-'); // "RES-PIERNA" (sin prefijo de especie en corteId)
-  const prod = S.products.find(p =>
-    p.sku === skuV1 || p.sku === skuV2 || p.sku === skuV3 ||
-    p.sku.includes(corteId.replace(/^[a-z]+_/,'').replace(/_/g,'-').toUpperCase()) ||
-    p.name.toLowerCase().includes(s.name?.toLowerCase() || corteId.replace(/_/g,' '))
-  );
+  // Buscar producto: primero por productId guardado, luego por todas las variantes de SKU
+  const skuV1 = (s.especie.substring(0,3) + '-' + corteId).toUpperCase().replace(/_/g,'-');
+  const skuV2 = corteId.toUpperCase().replace(/_/g,'-');
+  const skuV3 = (s.especie.substring(0,3) + '-' + corteId.replace(/^[a-z]+_/,'')).toUpperCase().replace(/_/g,'-');
+  const nombreBuscar = (s.name || corteId.replace(/_/g,' ')).toLowerCase();
+  const prod = (s.productId ? S.products.find(p => p.id === s.productId) : null) ||
+    S.products.find(p =>
+      p.sku === skuV1 || p.sku === skuV2 || p.sku === skuV3 ||
+      p.sku.includes(corteId.replace(/^[a-z]+_/,'').replace(/_/g,'-').toUpperCase()) ||
+      p.name.toLowerCase().includes(nombreBuscar)
+    );
+  // Si encontramos el producto, guardar su id en carnState para futuras llamadas
+  if (prod && !s.productId) {
+    s.productId = prod.id;
+    carnSave();
+  }
 
   if (prod) {
     // 1. Precio en memoria inmediatamente
@@ -2985,33 +3037,22 @@ async function carnGuardarPrecio(corteId) {
     // 3. Actualizar en Supabase con reintentos
     if (APP_CONFIG.backendType === 'supabase' && SupabaseAdapter._client) {
       try {
-        // Primer intento con updated_at
-        let { error } = await SupabaseAdapter._client
-          .from('products')
-          .update({ price: pv, updated_at: new Date().toISOString() })
-          .eq('id', prod.id);
+        await SupabaseAdapter.updateProductPrice(prod.id, pv, S.session?.id);
 
-        if (error) {
-          // Segundo intento: solo price
-          console.warn('Retry UPDATE solo price:', error.message);
-          const retry = await SupabaseAdapter._client
-            .from('products').update({ price: pv }).eq('id', prod.id);
-          if (retry.error) {
-            console.error('Error Supabase:', retry.error);
-            showToast('⚠️ No se pudo guardar en Supabase: ' + retry.error.message, 'error');
-          }
-        }
-
-        // 4. Verificar que quedó guardado leyendo de vuelta
+        // Verificar que quedó guardado
         const { data: check } = await SupabaseAdapter._client
           .from('products').select('price').eq('id', prod.id).single();
-        if (check && Number(check.price) !== pv) {
-          console.warn('Precio no coincide en Supabase, forzando escritura...');
-          await SupabaseAdapter._client.from('products').update({ price: pv }).eq('id', prod.id);
+        const savedPrice = check ? Number(check.price) : 0;
+        if (savedPrice === pv) {
+          // Confirmar backup con precio verificado
+          try { localStorage.setItem('inv3_price_' + prod.id, String(pv)); } catch(e) {}
+          showToast('✅ Precio $' + fmtDec(pv) + ' guardado y verificado en Supabase', 'success');
+        } else {
+          showToast('⚠️ Precio guardado localmente. En Supabase quedó: $' + fmtDec(savedPrice || 0), 'warning');
         }
       } catch(e) {
-        console.warn('Update precio excepción:', e);
-        showToast('Sin conexión — precio guardado localmente', 'warning');
+        console.error('Update precio excepción:', e);
+        showToast('⚠️ Error: ' + e.message, 'error');
       }
     } else if (APP_CONFIG.backendType === 'demo') {
       const products = await Backend.getProducts();
@@ -3029,10 +3070,8 @@ async function carnGuardarPrecio(corteId) {
 
   closeOv();
   carnRenderStock();
-  // Refrescar POS con precios actualizados
   renderPOSGrid();
   renderPOSCart();
-  showToast('Precio $' + fmtDec(pv) + '/kg guardado ✓ — visible en Caja y todos los dispositivos', 'success');
 }
 
 // ── REPORTE DE RENDIMIENTO ────────────────────────────────────────
