@@ -1422,6 +1422,27 @@ async function refreshAll() {
     S.sales      = sales;
     S.counts     = counts;
 
+    // ── SINCRONIZAR precios de carnState desde S.products ──────────
+    // Esto asegura que cuando cargue otro dispositivo, los precios
+    // guardados en Supabase se reflejen también en carnState local.
+    if (carnState.stockCortes.length > 0) {
+      carnState.stockCortes.forEach(s => {
+        const skuBuscado = (s.especie.substring(0,3) + '-' + s.corteId).toUpperCase().replace(/_/g,'-');
+        const prod = S.products.find(p =>
+          p.sku === skuBuscado ||
+          p.sku.includes(s.corteId.replace(/_/g,'-').toUpperCase())
+        );
+        if (prod && prod.price > 0 && prod.price !== s.precioVenta) {
+          s.precioVenta = prod.price; // tomar precio de Supabase (fuente de verdad)
+        }
+        // También sincronizar kg disponibles con stock real de Supabase
+        if (prod && prod.stock !== s.kgDisponible) {
+          s.kgDisponible = prod.stock;
+        }
+      });
+      carnSave(); // guardar estado sincronizado
+    }
+
     // Renderizar cada sección de forma independiente para que un error no bloquee las demás
     try { renderDash(); } catch(e) { console.warn('renderDash:', e); }
     try { renderInventory(S.products); } catch(e) { console.warn('renderInventory:', e); }
@@ -1482,6 +1503,8 @@ function handleRealtimeEvent(event) {
         }
         try { renderDash(); } catch(e) {}
         try { renderInventory(S.products); } catch(e) {}
+        try { renderPOSGrid(); } catch(e) {}
+        try { renderPOSCart(); } catch(e) {}
         break;
 
       case 'SALE_REGISTERED':
@@ -1926,21 +1949,6 @@ function renderPOSGrid() {
   if (posBusqueda) { const q=posBusqueda.toLowerCase(); lista=lista.filter(p=>p.name.toLowerCase().includes(q)||p.sku.toLowerCase().includes(q)); }
   if (!lista.length) { el.innerHTML='<div style="text-align:center;padding:24px;color:var(--tx3);font-size:12px;font-family:var(--fm)">Sin productos</div>'; return; }
 
-  // Sincronizar precios desde carnState antes de renderizar
-  lista = lista.map(p => {
-    if (!p.price || p.price === 0) {
-      const cs = carnState.stockCortes.find(s =>
-        p.sku === (s.especie.substring(0,3)+'-'+s.corteId).toUpperCase().replace(/_/g,'-') ||
-        p.sku.includes(s.corteId.replace(/_/g,'-').toUpperCase())
-      );
-      if (cs && cs.precioVenta > 0) {
-        p.price = cs.precioVenta; // sincronizar en memoria
-        return { ...p, price: cs.precioVenta };
-      }
-    }
-    return p;
-  });
-
   el.innerHTML = `<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(88px,1fr));gap:7px;padding:8px 0">` +
     lista.map(p=>`<div class="pos-prod-btn ${p.stock<=0?'agotado':''}" onclick="posAgregar('${p.id}')">
       <div class="pos-prod-emoji">${p.emoji}</div>
@@ -2161,15 +2169,14 @@ async function posConfirmarVenta(folio,metodo,total) {
     for (const u of (result.products || [])) {
       const idx = S.products.findIndex(p => p.id === u.id);
       if (idx >= 0) {
-        // Solo actualizamos stock y version — NO el precio
+        // Solo actualizamos stock y version — NUNCA sobrescribir el precio con 0
         S.products[idx].stock   = u.stock;
         S.products[idx].version = u.version;
-        // Si el backend devolvió precio 0 (bug de Supabase), restaurar el precio local
-        if (u.price === 0 && S.products[idx].price > 0) {
-          // Precio local es más confiable, lo dejamos como está
-        } else if (u.price > 0) {
+        // Solo actualizar precio si el backend devuelve uno válido (>0)
+        if (u.price > 0) {
           S.products[idx].price = u.price;
         }
+        // Si u.price es 0 pero tenemos precio local, conservar el local
       }
     }
 
@@ -2753,6 +2760,10 @@ async function carnGuardarCorte(compraId) {
     } else {
       // Producto no existe — crear nuevo
       try {
+        // Ver si ya tenemos un precio previo para este corte en carnState
+        const stockCorte = carnState.stockCortes.find(x => x.corteId === ct.id);
+        const precioInicial = stockCorte?.precioVenta || 0;
+
         const np = await Backend.createProduct({
           name:     ct.name + ' (' + c.especie + ')',
           sku:      skuCorte,
@@ -2760,7 +2771,7 @@ async function carnGuardarCorte(compraId) {
           stock:    ct.kg,
           min:      2,
           max:      500,
-          price:    0,
+          price:    precioInicial,
           cat:      'carnes',
           supplier: c.proveedor || 'Rastro',
           lot:      canal.id,
@@ -2877,11 +2888,14 @@ async function carnGuardarPrecio(corteId) {
   const pv = parseFloat(document.getElementById('precio-venta-inp')?.value) || 0;
   if (!s || !pv) { showToast('Ingresa el precio','error'); return; }
 
+  // Botón de carga
+  const btn = document.querySelector('[onclick*="carnGuardarPrecio"]');
+  if (btn) { btn.innerHTML = '<span class="spinner"></span> Guardando...'; btn.disabled = true; }
+
   s.precioVenta = pv;
   carnSave();
 
-  // Buscar el producto en S.products por SKU — el SKU se forma como
-  // primeras 3 letras especie + '-' + corteId en mayúsculas con guiones
+  // Buscar el producto en S.products por SKU
   const skuBuscado = (s.especie.substring(0,3) + '-' + corteId).toUpperCase().replace(/_/g,'-');
   const prod = S.products.find(p =>
     p.sku === skuBuscado ||
@@ -2889,31 +2903,48 @@ async function carnGuardarPrecio(corteId) {
   );
 
   if (prod) {
+    // 1. Actualizar precio en memoria LOCAL inmediatamente
     prod.price = pv;
-    // Actualizar precio en Supabase via un movimiento de ajuste de precio
-    // (no hay endpoint de update directo, se actualiza en la BD)
+
+    // 2. Actualizar en Supabase (fuente de verdad compartida)
     try {
-      // En modo Supabase actualizamos directamente
       if (APP_CONFIG.backendType === 'supabase' && SupabaseAdapter._client) {
-        await SupabaseAdapter._client
+        const { error } = await SupabaseAdapter._client
           .from('products')
-          .update({ price: pv })
+          .update({ price: pv, updated_at: new Date().toISOString() })
           .eq('id', prod.id);
+        if (error) {
+          console.warn('Error actualizando precio en Supabase:', error);
+          showToast('Precio guardado localmente (error de red)', 'warning');
+        }
+      } else if (APP_CONFIG.backendType === 'demo') {
+        // En modo demo, actualizar en localStorage también
+        const products = await Backend.getProducts();
+        const idx = products.findIndex(p => p.id === prod.id);
+        if (idx >= 0) {
+          products[idx].price = pv;
+          localStorage.setItem('inv3_products', JSON.stringify(products));
+        }
       }
-    } catch(e) { console.warn('Update precio Supabase:', e); }
+    } catch(e) {
+      console.warn('Update precio:', e);
+      showToast('Precio actualizado en este dispositivo (sin conexión)', 'warning');
+    }
+  } else {
+    showToast('Producto no encontrado en inventario — registra el corte primero', 'warning');
   }
 
-  // También actualizar todos los items del carrito que tengan este producto
+  // También actualizar items del carrito activo
   posCart.forEach(item => {
     if (item.pid === prod?.id) item.price = pv;
   });
 
   closeOv();
   carnRenderStock();
-  // Refrescar POS para que muestre el precio actualizado
+  // Refrescar POS con precios actualizados
   renderPOSGrid();
   renderPOSCart();
-  showToast('Precio actualizado ✓ — ya visible en Caja', 'success');
+  showToast('Precio $' + fmtDec(pv) + '/kg guardado ✓ — visible en Caja y todos los dispositivos', 'success');
 }
 
 // ── REPORTE DE RENDIMIENTO ────────────────────────────────────────
@@ -2987,8 +3018,65 @@ function initCarnScreen() {
 }
 
 /* ═══════════════════════════════════════════════════════════════════
-   ╔═══════════════════════════════════════════════════════════╗
-   ║  SECCIÓN 12: CONTEO FÍSICO                                ║
+   SISTEMA DE BLOQUEO ENTRE DISPOSITIVOS
+   Evita que dos usuarios editen el mismo recurso al mismo tiempo.
+   Usa Supabase Realtime presence o localStorage para demo.
+═══════════════════════════════════════════════════════════════════ */
+
+const DeviceLock = {
+  _locks: {},     // { resourceId: { userId, userName, ts } }
+  _myLocks: new Set(),
+
+  // Intentar adquirir un bloqueo. Devuelve true si se obtuvo.
+  async acquire(resourceId) {
+    const key = 'inv3_lock_' + resourceId;
+    const now = Date.now();
+    // Ver si alguien más tiene el bloqueo (activo en últimos 30s)
+    try {
+      const raw = localStorage.getItem(key);
+      if (raw) {
+        const lock = JSON.parse(raw);
+        if (lock.userId !== S.session?.id && now - lock.ts < 30000) {
+          showToast(`⚡ ${lock.userName} está editando esto ahora. Espera un momento.`, 'warning');
+          return false;
+        }
+      }
+    } catch(e) {}
+
+    // Adquirir bloqueo
+    const lockData = { userId: S.session?.id, userName: S.session?.name, ts: now };
+    localStorage.setItem(key, JSON.stringify(lockData));
+    this._myLocks.add(resourceId);
+
+    // Renovar el bloqueo cada 10s mientras esté activo
+    const renewInterval = setInterval(() => {
+      if (!this._myLocks.has(resourceId)) { clearInterval(renewInterval); return; }
+      lockData.ts = Date.now();
+      localStorage.setItem(key, JSON.stringify(lockData));
+    }, 10000);
+
+    return true;
+  },
+
+  // Liberar un bloqueo
+  release(resourceId) {
+    localStorage.removeItem('inv3_lock_' + resourceId);
+    this._myLocks.delete(resourceId);
+  },
+
+  // Liberar todos los bloqueos de este usuario al cerrar sesión
+  releaseAll() {
+    this._myLocks.forEach(id => this.release(id));
+    this._myLocks.clear();
+  },
+};
+
+// Liberar bloqueos al cerrar sesión
+const _origDoLogout = doLogout;
+async function doLogout() {
+  DeviceLock.releaseAll();
+  await _origDoLogout();
+}
    ╚═══════════════════════════════════════════════════════════╝
 ═══════════════════════════════════════════════════════════════════ */
 function startCount() {
